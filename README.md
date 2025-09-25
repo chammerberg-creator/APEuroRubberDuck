@@ -1,19 +1,27 @@
-# 🎈 Blank app template
 
-A simple Streamlit app template for you to modify!
+# Rubber Duck — Feynman Practice (MVP)
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
+This is a minimal Streamlit app for Feynman-style practice. Students explain; **Rubber Duck** asks one short, scoped question at a time. End with a downloadable study guide (.docx).
 
-### How to run it on your own machine
+## Quick web setup (Streamlit Community Cloud)
 
-1. Install the requirements
-
+1. Create a GitHub repo (e.g., `rubber-duck-feynman`).
+2. Upload three files into the repo:
+   - `app.py`
+   - `requirements.txt`
+   - `README.md`
+3. Go to Streamlit Community Cloud → **New app** → pick your GitHub repo → file = `app.py` → **Deploy**.
+4. App **⋯ → Settings → Secrets** → add:
    ```
-   $ pip install -r requirements.txt
+   OPENAI_API_KEY="sk-...your key ..."
+   OPENAI_CHAT_MODEL="gpt-4o-mini"
    ```
+5. Share the app URL with students.
 
-2. Run the app
+## Local run (optional)
 
-   ```
-   $ streamlit run streamlit_app.py
-   ```
+```bash
+pip install -U streamlit openai python-docx
+export OPENAI_API_KEY=YOUR_KEY   # Windows: $env:OPENAI_API_KEY="YOUR_KEY"
+streamlit run app.py
+```
