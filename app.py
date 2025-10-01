@@ -1,4 +1,4 @@
-# app.py — Rubber Duck (multi-textbook-ready) pulling public PDFs from GitHub
+# app.py — Rubber Duck (with Quick mode + progress) pulling public PDFs from GitHub
 import os, glob, re, hashlib, time
 from typing import List, Tuple
 from urllib.parse import quote
@@ -18,7 +18,8 @@ st.set_page_config(page_title="Rubber Duck — Ask the Textbook", layout="wide")
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     st.error("Missing OPENAI_API_KEY in Streamlit Secrets.")
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Add a client timeout so embedding calls cannot stall forever
+client = OpenAI(api_key=OPENAI_API_KEY, timeout=60)
 
 # OPTIONAL: only needed if you later add private repos (kept here for future use)
 GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN")
@@ -51,8 +52,25 @@ BOOKS = {
 BOOKS_ROOT = "books"  # local cache root (per book)
 EMBED_MODEL = "text-embedding-3-small"
 TOP_K = 6
-CHUNK_TOKENS = 700
-CHUNK_OVERLAP = 150
+CHUNK_TOKENS = 500     # lower for faster first index
+CHUNK_OVERLAP = 100    # lower overlap for speed
+
+# -------------------- SIDEBAR --------------------
+st.sidebar.title("Rubber Duck")
+book_key = st.sidebar.selectbox(
+    "Choose a textbook",
+    options=list(BOOKS.keys()),
+    format_func=lambda k: BOOKS[k]["label"]
+)
+
+# Quick mode toggle to index a subset (helps avoid long first-run times)
+DEV_quick = st.sidebar.toggle(
+    "Quick mode (first few PDFs/pages)",
+    value=True,
+    help="Index a small sample to verify end-to-end. Turn off for full textbook."
+)
+MAX_PDFS  = 3 if DEV_quick else None     # first N PDFs
+MAX_PAGES = 8 if DEV_quick else None     # first N pages per PDF
 
 # -------------------- HELPERS --------------------
 def _headers():
@@ -168,41 +186,76 @@ def ensure_book_downloaded(book_key: str):
     return d, present
 
 def cache_sig_for(book_key: str) -> str:
-    """Stable signature to key the FAISS index cache for this book."""
+    """Stable signature to key the FAISS index cache for this book + settings."""
     cfg = BOOKS[book_key]
     _, files = ensure_book_downloaded(book_key)
-    sig = cfg.get("version", "v0") + "|" + "|".join(files)
+    extra = f"quick={DEV_quick}|mpdfs={MAX_PDFS}|mpages={MAX_PAGES}|ct={CHUNK_TOKENS}|co={CHUNK_OVERLAP}"
+    sig = cfg.get("version", "v0") + "|" + "|".join(files) + "|" + extra
     return hashlib.sha1(sig.encode()).hexdigest()
 
-@st.cache_resource(show_spinner=True)
+@st.cache_resource(show_spinner=False)
 def build_index(book_key: str, cache_sig: str):
-    """Build (or load) FAISS index for the selected book."""
+    """Build (or load) FAISS index for the selected book with progress + retries."""
     book_dir, files = ensure_book_downloaded(book_key)
+    if MAX_PDFS:
+        files = files[:MAX_PDFS]
+
+    status = st.status("Indexing textbook…", expanded=True)
+    status.write("Step 1/4: Extracting & chunking pages…")
     texts, metas = [], []
-    for f in files:
+
+    for fi, f in enumerate(files, 1):
         path = os.path.join(book_dir, f)
-        for page_num, text in extract_pages(path):
-            for ch in chunk_text(text, f, page_num):
-                texts.append(ch["text"]); metas.append(ch["meta"])
+        pages = extract_pages(path)
+        if MAX_PAGES:
+            pages = pages[:MAX_PAGES]
+        for page_num, text in pages:
+            # chunk immediately (keeps memory modest)
+            toks = text.split()
+            i = 0
+            while i < len(toks):
+                j = min(len(toks), i + CHUNK_TOKENS)
+                ch = " ".join(toks[i:j])
+                texts.append(ch)
+                metas.append({"chapter": f, "page": page_num})
+                i = j - CHUNK_OVERLAP if j - CHUNK_OVERLAP > i else j
+        status.write(f" • {fi}/{len(files)}: {f} — {len(pages)} pages")
 
     if not texts:
         dim = 1536
         arr = np.zeros((1, dim), dtype="float32")
         faiss.normalize_L2(arr)
         idx = faiss.IndexFlatIP(dim); idx.add(arr)
+        status.update(label="Indexing complete (no text found).", state="complete")
         return idx, texts, metas
 
-    # Embed in batches
+    status.write("Step 2/4: Creating embeddings…")
+    BATCH = 64  # smaller batch = fewer rate-limit errors + more responsive
     vectors = []
-    BATCH = 128
-    for i in range(0, len(texts), BATCH):
-        batch = texts[i:i + BATCH]
-        emb = client.embeddings.create(model=EMBED_MODEL, input=batch).data
-        vectors.extend([e.embedding for e in emb])
+    prog = st.progress(0.0)
+    total = len(texts)
+    for i in range(0, total, BATCH):
+        batch = texts[i:i+BATCH]
+        # retries for transient errors
+        for attempt in range(4):
+            try:
+                resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
+                vectors.extend([d.embedding for d in resp.data])
+                break
+            except Exception as e:
+                if attempt == 3:
+                    status.update(label=f"Embedding failed: {e}", state="error")
+                    raise
+                time.sleep(1.5 * (attempt + 1))
+        prog.progress(min(1.0, (i + len(batch)) / total))
 
+    status.write("Step 3/4: Building FAISS index…")
     arr = np.array(vectors, dtype="float32")
     faiss.normalize_L2(arr)
-    idx = faiss.IndexFlatIP(arr.shape[1]); idx.add(arr)
+    idx = faiss.IndexFlatIP(arr.shape[1])
+    idx.add(arr)
+
+    status.update(label="Step 4/4: Done! ✔️", state="complete")
     return idx, texts, metas
 
 def search(idx, texts, metas, query: str, k: int = TOP_K):
@@ -216,14 +269,6 @@ def search(idx, texts, metas, query: str, k: int = TOP_K):
             out.append({"score": float(score), "text": texts[ix], **metas[ix]})
     return out
 
-# -------------------- UI --------------------
-st.sidebar.title("Rubber Duck")
-book_key = st.sidebar.selectbox(
-    "Choose a textbook",
-    options=list(BOOKS.keys()),
-    format_func=lambda k: BOOKS[k]["label"]
-)
-
 # Ensure chapters are present locally
 with st.sidebar:
     _, present = ensure_book_downloaded(book_key)
@@ -233,10 +278,11 @@ with st.sidebar:
         st.cache_resource.clear()
         st.rerun()
 
-# Build / reuse index (cached per book + version/files)
+# Build / reuse index (cached per book + version/files + quick settings)
 sig = cache_sig_for(book_key)
 idx, texts, metas = build_index(book_key, sig)
 
+# -------------------- UI: Q&A --------------------
 st.title("Ask the textbook")
 st.caption(f"Book: **{BOOKS[book_key]['label']}**  •  Indexed chunks: {len(texts)}  •  PDFs: {len(set(m['chapter'] for m in metas))}")
 
@@ -269,7 +315,7 @@ if q:
         st.markdown("### Answer")
         st.write(resp.choices[0].message.content)
 
-# Diagnostics (optional)
+# -------------------- Diagnostics (optional) --------------------
 with st.expander("Diagnostics (PDF health check)"):
     d, present = ensure_book_downloaded(book_key)
     bad = []
