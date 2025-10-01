@@ -1,206 +1,238 @@
-"""
-Rubber Duck — Feynman Practice (MVP)  — Streamlit Cloud friendly
-[...trimmed in this comment: full content inserted again below...]
-"""
-import os
-import re
-import uuid
-from datetime import datetime
-from typing import List, Dict
-from io import BytesIO
+# app.py — Rubber Duck (multi-textbook) with remote GitHub chapters
+import os, glob, re, hashlib
+from typing import List, Tuple
+from urllib.parse import quote
 
+import requests
+import numpy as np
 import streamlit as st
+from pypdf import PdfReader
 from openai import OpenAI
-from docx import Document
-from docx.shared import Pt
+import faiss
 
-APP_TITLE = "🦆 Rubber Duck — Feynman Practice (MVP)"
-DEFAULT_MODEL = os.environ.get("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-VOCAB_CAP = 16
+# -------------------- BASIC CONFIG --------------------
+st.set_page_config(page_title="Rubber Duck — Ask the Textbook", layout="wide")
 
-_api_key = (st.secrets.get("OPENAI_API_KEY", None) 
-            if hasattr(st, "secrets") else None) or os.environ.get("OPENAI_API_KEY", None)
-try:
-    client = OpenAI(api_key=_api_key) if _api_key else OpenAI()
-except Exception as e:
-    client = None
+# REQUIRED: set in Streamlit Secrets
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    st.error("Missing OPENAI_API_KEY in Streamlit Secrets.")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-def ensure_state():
-    st.session_state.setdefault("active_scope_title", "")
-    st.session_state.setdefault("chapters", [])
-    st.session_state.setdefault("chat_history", [])
-    st.session_state.setdefault("student_name", "")
-    st.session_state.setdefault("chapter_limit", 1)
-    st.session_state.setdefault("captured_terms", set())
+# OPTIONAL: only needed if any source repo is private
+GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN")
 
-def extract_candidate_terms(text: str):
-    import re
-    cleaned = re.sub(r"[^A-Za-z0-9\-\s]", " ", text)
-    tokens = cleaned.split()
-    candidates = []
-    for i, tok in enumerate(tokens):
-        if (tok.istitle() and i + 1 < len(tokens) and tokens[i + 1].istitle()) or ("-" in tok and len(tok) > 3):
-            candidates.append(tok)
-        elif tok.istitle() and len(tok) > 3:
-            candidates.append(tok)
-    seen = set(); out = []
-    for t in candidates:
-        if t.lower() not in seen:
-            seen.add(t.lower()); out.append(t)
-    return out[:VOCAB_CAP]
+# Your AP Euro chapters repo (public works out of the box)
+OWNER  = "chammerberg-creator"
+REPO   = "rubber-duck-APE-chapters"
+BRANCH = "main"
 
-def build_system_prompt(scope_title: str, chapter_limit: int) -> str:
-    return f"""
-You are **Rubber Duck**, a curious peer using the Feynman Technique in a history class.
-Ask, don't tell. One short question at a time. Stay strictly within the student's declared progress.
+# Generate filenames: "McKay Chapter 11 OCR.pdf" ... "McKay Chapter 30 OCR.pdf"
+EURO_FILES = [f"McKay Chapter {i} OCR.pdf" for i in range(11, 31)]
 
-SCOPE_TITLE: {scope_title or '(not set)'}
-STUDENT_PROGRESS: up to Chapter {chapter_limit}
+# Catalog (easy to add more textbooks later)
+BOOKS = {
+    "ap_euro_mckay_13e": {
+        "label": "AP Euro — McKay (13e)",
+        "version": "v1",   # bump when you add/replace PDFs to rebuild caches
+        # If repo is PUBLIC, use mode 'raw' (simplest). If PRIVATE, switch to 'github_api' and add GITHUB_TOKEN in Secrets.
+        "mode": "raw",     # "raw" | "github_api"
+        # For 'raw' mode we use raw.githubusercontent URLs:
+        "base": f"https://raw.githubusercontent.com/{OWNER}/{REPO}/{BRANCH}/",
+        "files": EURO_FILES,
+        # For 'github_api' mode (private repos), fill these fields instead:
+        "owner": OWNER,
+        "repo": REPO,
+        "branch": BRANCH,
+        "path": "",     # e.g., "chapters" if your PDFs are inside a folder; "" for repo root
+    },
+    # Add more textbooks here later...
+}
 
-Priorities (in order):
-1) Missing definitions (ask for plain-language definitions of in-scope vocabulary)
-2) Concrete examples (real people/events, data, places) — avoid abstractions
-3) Cause → effect and contrasts (how is this similar/different, why?)
-4) Significance (why it matters)
+BOOKS_ROOT = "books"  # local cache root (per book)
+EMBED_MODEL = "text-embedding-3-small"
+TOP_K = 6
+CHUNK_TOKENS = 700
+CHUNK_OVERLAP = 150
 
-Rules:
-- Never lecture the correct answer; guide with questions.
-- Never ask about future chapters; if invited, politely refocus on the current scope.
-- Occasionally (low frequency) restate something slightly wrong to invite correction.
-- Do not quote textbooks or external sources. Use any provided excerpts only to choose better questions.
-- Keep responses concise and friendly. Exactly one question per turn.
-""".strip()
+# -------------------- HELPERS --------------------
+def _headers():
+    h = {"User-Agent": "RubberDuck/1.0"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
 
-def next_rubber_duck_reply(scope_title: str, chapter_limit: int, history, model: str) -> str:
-    if client is None:
-        return "(OpenAI client is not configured. Add OPENAI_API_KEY in Streamlit Secrets or environment.)"
-    system_prompt = build_system_prompt(scope_title, chapter_limit)
-    hidden_context = "RETRIEVED_EXCERPTS (for internal guidance only; do not reveal):\n(none in MVP)"
-    messages = [{"role": "system", "content": system_prompt},
-                {"role": "system", "content": hidden_context},
-                *history[-20:]]
-    resp = client.chat.completions.create(
-        model=model, messages=messages, temperature=0.4, max_tokens=220
-    )
-    return resp.choices[0].message.content.strip()
+def clean(s: str) -> str:
+    return re.sub(r"[ ]{2,}", " ", s.replace("\u00a0", " ").replace("\t", " ")).strip()
 
-def render_docx_buffer(student_name, scope_title, chapter_limit, transcript, vocab_terms):
-    from docx import Document
-    from docx.shared import Pt
-    from io import BytesIO
-    from datetime import datetime
+def extract_pages(path: str) -> List[Tuple[int, str]]:
+    out = []
+    reader = PdfReader(path)
+    for i, p in enumerate(reader.pages):
+        t = clean(p.extract_text() or "")
+        if t:
+            out.append((i + 1, t))
+    return out
 
-    doc = Document()
-    title = doc.add_paragraph()
-    run = title.add_run("Personalized Study Guide — Rubber Duck (Feynman)")
-    run.bold = True; run.font.size = Pt(18)
+def chunk_text(text: str, fname: str, page: int):
+    toks = text.split()
+    i, out = 0, []
+    while i < len(toks):
+        j = min(len(toks), i + CHUNK_TOKENS)
+        ch = " ".join(toks[i:j])
+        out.append({"text": ch, "meta": {"chapter": fname, "page": page}})
+        i = j - CHUNK_OVERLAP if j - CHUNK_OVERLAP > i else j
+    return out
 
-    meta = doc.add_paragraph()
-    meta.add_run("Student: ").bold = True; meta.add_run(student_name or "[Name]")
-    meta.add_run("    Date: ").bold = True; meta.add_run(datetime.now().strftime("%Y-%m-%d"))
-    meta.add_run("    Scope: ").bold = True; meta.add_run(f"{scope_title or '[Chapter]'} — up to Chapter {chapter_limit}")
+def local_book_dir(book_key: str) -> str:
+    d = os.path.join(BOOKS_ROOT, book_key)
+    os.makedirs(d, exist_ok=True)
+    return d
 
-    doc.add_heading("1) Snapshot Summary", level=2)
-    student_lines = [m["content"] for m in transcript if m["role"] == "user"][-4:]
-    if student_lines:
-        doc.add_paragraph("Here’s what you explained in this session:")
-        for s in student_lines:
-            doc.add_paragraph(f"• {s[:200]}" + ("…" if len(s) > 200 else ""))
+def list_pdfs_via_github(owner: str, repo: str, path: str, branch: str):
+    """List PDFs at a path using GitHub Contents API (useful for private repos)."""
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path or ''}?ref={branch}"
+    r = requests.get(url, headers=_headers(), timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    files = [item["name"] for item in data if item["type"] == "file" and item["name"].lower().endswith(".pdf")]
+    return sorted(files)
+
+@st.cache_data(show_spinner=True)
+def ensure_book_downloaded(book_key: str):
+    """Download PDFs for the selected book into books/<book_key>/ if not already present."""
+    cfg = BOOKS[book_key]
+    d = local_book_dir(book_key)
+
+    mode = cfg.get("mode", "raw")
+    if mode == "raw":
+        base = cfg["base"].rstrip("/") + "/"
+        files = cfg["files"]
+        for f in files:
+            dest = os.path.join(d, f)
+            if not os.path.exists(dest):
+                url = base + quote(f, safe="")  # handle spaces in filenames
+                r = requests.get(url, headers=_headers(), timeout=120)
+                r.raise_for_status()
+                with open(dest, "wb") as out:
+                    out.write(r.content)
+    elif mode == "github_api":
+        owner, repo, branch, path = cfg["owner"], cfg["repo"], cfg["branch"], cfg.get("path") or ""
+        files = cfg.get("files")
+        if not files:
+            files = list_pdfs_via_github(owner, repo, path, branch)
+        for f in files:
+            dest = os.path.join(d, f)
+            if not os.path.exists(dest):
+                url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path + '/' if path else ''}{f}"
+                r = requests.get(url, headers=_headers(), timeout=120)
+                r.raise_for_status()
+                with open(dest, "wb") as out:
+                    out.write(r.content)
     else:
-        doc.add_paragraph("[Your summary here]")
+        raise ValueError("Unknown BOOKS mode (use 'raw' or 'github_api').")
 
-    doc.add_heading("2) Strengths — Covered Well", level=2)
-    doc.add_paragraph("• Provided specific examples when prompted.")
-    doc.add_paragraph("• Clarified at least one definition in plain language.")
+    present = sorted([os.path.basename(p) for p in glob.glob(os.path.join(d, "*.pdf"))])
+    return d, present
 
-    doc.add_heading("3) Focus Areas — Needs Review", level=2)
-    doc.add_paragraph("• Define key terms succinctly before details.")
-    doc.add_paragraph("• Add cause → effect links and significance.")
+def cache_sig_for(book_key: str) -> str:
+    """Stable signature to key the FAISS index cache for this book."""
+    cfg = BOOKS[book_key]
+    _, files = ensure_book_downloaded(book_key)
+    sig = cfg.get("version", "v0") + "|" + "|".join(files)
+    return hashlib.sha1(sig.encode()).hexdigest()
 
-    doc.add_heading("4) Vocabulary Status", level=2)
-    table = doc.add_table(rows=1, cols=3)
-    hdr = table.rows[0].cells
-    hdr[0].text = "Term"; hdr[1].text = "Student’s Definition (own words)"; hdr[2].text = "Status (Mastered / Developing / Review)"
-    for term in list(vocab_terms)[:VOCAB_CAP]:
-        row = table.add_row().cells
-        row[0].text = term; row[1].text = "[your definition]"; row[2].text = "Developing"
+@st.cache_resource(show_spinner=True)
+def build_index(book_key: str, cache_sig: str):
+    """Build (or load) FAISS index for the selected book."""
+    book_dir, files = ensure_book_downloaded(book_key)
+    texts, metas = [], []
+    for f in files:
+        path = os.path.join(book_dir, f)
+        for page_num, text in extract_pages(path):
+            for ch in chunk_text(text, f, page_num):
+                texts.append(ch["text"]); metas.append(ch["meta"])
 
-    doc.add_heading("8) Action Plan (Next Steps)", level=2)
-    doc.add_paragraph("1) Re‑explain the core idea in one sentence.")
-    doc.add_paragraph("2) Add one concrete example with who/when/where.")
-    doc.add_paragraph("3) Write a cause → effect chain and one sentence on why it matters.")
+    if not texts:
+        dim = 1536
+        arr = np.zeros((1, dim), dtype="float32")
+        faiss.normalize_L2(arr)
+        idx = faiss.IndexFlatIP(dim); idx.add(arr)
+        return idx, texts, metas
 
-    buf = BytesIO(); doc.save(buf); buf.seek(0); return buf
+    # Embed in batches
+    vectors = []
+    BATCH = 128
+    for i in range(0, len(texts), BATCH):
+        batch = texts[i:i + BATCH]
+        emb = client.embeddings.create(model=EMBED_MODEL, input=batch).data
+        vectors.extend([e.embedding for e in emb])
 
-# UI
-st.set_page_config(page_title="Rubber Duck — Feynman MVP", page_icon="🦆", layout="wide")
-st.title(APP_TITLE); ensure_state()
+    arr = np.array(vectors, dtype="float32")
+    faiss.normalize_L2(arr)
+    idx = faiss.IndexFlatIP(arr.shape[1]); idx.add(arr)
+    return idx, texts, metas
 
+def search(idx, texts, metas, query: str, k: int = TOP_K):
+    qemb = client.embeddings.create(model=EMBED_MODEL, input=[query]).data[0].embedding
+    q = np.array([qemb], dtype="float32")
+    faiss.normalize_L2(q)
+    sims, ids = idx.search(q, k)
+    out = []
+    for score, ix in zip(sims[0], ids[0]):
+        if 0 <= ix < len(texts):
+            out.append({"score": float(score), "text": texts[ix], **metas[ix]})
+    return out
+
+# -------------------- UI --------------------
+st.sidebar.title("Rubber Duck")
+book_key = st.sidebar.selectbox(
+    "Choose a textbook",
+    options=list(BOOKS.keys()),
+    format_func=lambda k: BOOKS[k]["label"]
+)
+
+# Ensure chapters are present locally
 with st.sidebar:
-    st.header("Mode")
-    mode = st.radio("Select mode", ["Teacher", "Student"], horizontal=True)
-    model = st.text_input("Model (optional)", value=DEFAULT_MODEL, help="e.g., gpt-4o-mini")
-    if not _api_key:
-        st.warning("Add OPENAI_API_KEY in Streamlit Secrets (or set env var) to enable responses.")
+    _, present = ensure_book_downloaded(book_key)
+    st.success(f"Chapters ready: {len(present)} files")
+    if st.button("Refresh chapters / Rebuild index"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.rerun()
 
-if mode == "Teacher":
-    st.subheader("Teacher: Scope & Chapters")
-    scope_title = st.text_input("Scope title (e.g., 'Expansion of Europe, Units 1–4')", value=st.session_state.active_scope_title)
-    st.write("**Upload chapter files (optional in MVP):** Their names become the chapter list. Sorting is by filename.")
-    uploads = st.file_uploader("Chapters (PDF/TXT)", type=["pdf", "txt"], accept_multiple_files=True)
-    if st.button("Activate Scope"):
-        st.session_state.active_scope_title = scope_title
-        chapters = []
-        if uploads:
-            for i, uf in enumerate(sorted(uploads, key=lambda x: x.name), start=1):
-                chapters.append({"order": i, "id": uf.name})
-        else:
-            chapters = [{"order": i, "id": f"Chapter {i}"} for i in range(1, 6)]
-        st.session_state.chapters = chapters
-        st.success(f"Activated scope with {len(chapters)} chapter(s).")
-    if st.session_state.chapters:
-        st.markdown("**Chapters:**")
-        st.write([f"{c['order']:02d} — {c['id']}" for c in st.session_state.chapters])
-else:
-    st.subheader("Student: Explain your chapter — I’m Rubber Duck 🦆")
-    if not st.session_state.chapters:
-        st.info("No active scope yet. Ask your teacher to activate chapters in Teacher mode."); st.stop()
-    st.session_state.student_name = st.text_input("Your name", value=st.session_state.student_name)
-    labels = [f"{c['order']:02d} — {c['id']}" for c in st.session_state.chapters]
-    default_idx = min(len(labels) - 1, 0)
-    choice = st.selectbox("Last chapter you finished", labels, index=default_idx)
-    chapter_limit = int(choice.split(" — ")[0]) if choice else 1
-    st.session_state.chapter_limit = chapter_limit
-    st.caption("Starter line (optional): 'We’re practicing the Feynman Technique. I read [chapter] up to this point…'")
+# Build / reuse index (cached per book + version/files)
+sig = cache_sig_for(book_key)
+idx, texts, metas = build_index(book_key, sig)
 
-    for m in st.session_state.chat_history:
-        st.chat_message("user" if m["role"] == "user" else "assistant").markdown(m["content"])
+st.title("Ask the textbook")
+st.caption(f"Book: **{BOOKS[book_key]['label']}**  •  Indexed chunks: {len(texts)}  •  PDFs: {len(set(m['chapter'] for m in metas))}")
 
-    user_msg = st.chat_input("Start explaining here… (I’ll ask one short question at a time)")
-    if user_msg:
-        st.session_state.chat_history.append({"role": "user", "content": user_msg})
-        for term in extract_candidate_terms(user_msg):
-            st.session_state.captured_terms.add(term)
-        with st.chat_message("assistant"):
-            try:
-                reply = next_rubber_duck_reply(st.session_state.active_scope_title, chapter_limit, st.session_state.chat_history, model)
-            except Exception as e:
-                reply = f"(Error generating response: {e})"
-            st.markdown(reply)
-        st.session_state.chat_history.append({"role": "assistant", "content": reply})
+q = st.text_input("Your question:", placeholder="e.g., Identify two political effects of the Protestant Reformation.")
 
-    st.divider()
-    if st.button("All done — generate my study guide"):
-        vocab_terms = list(st.session_state.captured_terms)[:VOCAB_CAP]
-        buf = render_docx_buffer(
-            st.session_state.student_name,
-            st.session_state.active_scope_title,
-            st.session_state.chapter_limit,
-            st.session_state.chat_history,
-            vocab_terms,
+if q:
+    with st.spinner("Retrieving…"):
+        hits = search(idx, texts, metas, q, k=TOP_K)
+
+    st.markdown("### Sources")
+    if not hits:
+        st.info("No matches found in this textbook. Try different phrasing or choose another book.")
+    else:
+        for i, h in enumerate(hits, 1):
+            st.markdown(f"**{i}. {h['chapter']} • p.{h['page']}** (score {h['score']:.3f})")
+            st.write(h["text"][:700] + ("..." if len(h["text"])>700 else ""))
+
+    # Compose context and call chat model (RAG)
+    if hits:
+        context = "\n\n---\n\n".join([f"[{h['chapter']} p.{h['page']}]\n{h['text']}" for h in hits])
+        system_msg = (
+            "You are a helpful AP tutor. Answer ONLY using the provided context. "
+            "Cite inline like [filename.pdf p.X]. If the answer is not in the context, say so."
         )
-        filename = f"{(st.session_state.student_name or 'student').replace(' ', '_')}_rubber_duck_study_guide_{datetime.now():%Y%m%d_%H%M%S}.docx"
-        st.download_button("Download study guide (.docx)", data=buf.getvalue(), file_name=filename,
-                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-        st.success("Study guide generated! You can download it above.")
-    st.caption("I’ll only ask about chapters you’ve finished. If I miss something, nudge me!")
+        msgs = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": f"Question: {q}\n\nContext:\n{context}"}
+        ]
+        resp = client.chat.completions.create(model="gpt-4o-mini", messages=msgs, temperature=0.2)
+        st.markdown("### Answer")
+        st.write(resp.choices[0].message.content)
